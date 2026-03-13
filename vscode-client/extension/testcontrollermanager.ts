@@ -1,7 +1,9 @@
 import { red, yellow, blue } from "ansi-colors";
+import { spawn } from "child_process";
 import * as vscode from "vscode";
 import { DebugManager } from "./debugmanager";
 import * as fs from "fs";
+import * as path from "path";
 
 import { ClientState, LanguageClientsManager, toVsCodeRange } from "./languageclientsmanger";
 import { escapeRobotGlobPatterns, filterAsync, Mutex, sleep, truncateAndReplaceNewlines, WeakValueMap } from "./utils";
@@ -52,6 +54,8 @@ interface RobotCodeDiscoverResult {
   items?: RobotTestItem[];
   diagnostics?: { [Key: string]: Diagnostic[] };
 }
+
+type FastDiscoveryPrefilterCommand = "auto" | "gitGrep" | "grep" | "none";
 
 interface RobotCodeProfileInfo {
   name: string;
@@ -719,6 +723,10 @@ export class TestControllerManager {
     if (!(await this.languageClientsManager.isValidRobotEnvironmentInFolder(folder))) {
       return {};
     }
+    const startTime = Date.now();
+    this.outputChannel.appendLine(
+      `discover tests: start workspace=${folder.name} discoverArgs=${discoverArgs.join(" ")} extraArgsCount=${extraArgs.length}`,
+    );
 
     const config = vscode.workspace.getConfiguration(CONFIG_SECTION, folder);
     const profiles = config.get<string[]>("profiles", []);
@@ -748,7 +756,7 @@ export class TestControllerManager {
         ...pythonPath.flatMap((v) => ["-P", v]),
         ...languages.flatMap((v) => ["--language", v]),
         ...robotArgs,
-        ...extraArgs,
+        ...(extraArgs.length ? ["--", ...extraArgs] : []),
       ],
       profiles,
       "json",
@@ -787,10 +795,244 @@ export class TestControllerManager {
       });
     }
 
+    this.outputChannel.appendLine(
+      `discover tests: done workspace=${folder.name} elapsedMs=${Date.now() - startTime} items=${result?.items?.length ?? 0}`,
+    );
+
     return result;
   }
 
   private readonly lastDiscoverResults = new WeakMap<vscode.WorkspaceFolder, RobotCodeDiscoverResult>();
+
+  // eslint-disable-next-line class-methods-use-this
+  private isFastDiscoveryEnabled(folder: vscode.WorkspaceFolder): boolean {
+    return vscode.workspace
+      .getConfiguration(CONFIG_SECTION, folder)
+      .get<boolean>("testExplorer.fastDiscovery.enabled", false);
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private getFastDiscoveryPrefilterCommand(folder: vscode.WorkspaceFolder): FastDiscoveryPrefilterCommand {
+    return vscode.workspace
+      .getConfiguration(CONFIG_SECTION, folder)
+      .get<FastDiscoveryPrefilterCommand>("testExplorer.fastDiscovery.prefilterCommand", "auto");
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private getFastDiscoveryRoots(folder: vscode.WorkspaceFolder): string[] {
+    const configuredPaths = vscode.workspace
+      .getConfiguration(CONFIG_SECTION, folder)
+      .get<string[] | undefined>("robot.paths");
+    const roots = configuredPaths?.length ? configuredPaths : ["."];
+    return roots.map((v) => v.trim()).filter((v) => v.length > 0);
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private isFastDiscoveryCommandEnabled(folder: vscode.WorkspaceFolder): boolean {
+    return vscode.workspace
+      .getConfiguration(CONFIG_SECTION, folder)
+      .get<boolean>("testExplorer.fastDiscovery.command.enabled", false);
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private async runShellCommand(
+    command: string,
+    args: string[],
+    cwd: string,
+    token?: vscode.CancellationToken,
+  ): Promise<{ exitCode: number | null; stdout: string; stderr: string; error?: unknown }> {
+    return await new Promise((resolve) => {
+      const abortController = new AbortController();
+
+      token?.onCancellationRequested(() => {
+        abortController.abort();
+      });
+
+      const process = spawn(command, args, {
+        cwd,
+        signal: abortController.signal,
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      process.stdout.setEncoding("utf8");
+      process.stderr.setEncoding("utf8");
+      process.stdout.on("data", (data) => {
+        stdout += data;
+      });
+      process.stderr.on("data", (data) => {
+        stderr += data;
+      });
+
+      process.on("error", (error) => {
+        resolve({ exitCode: null, stdout, stderr, error });
+      });
+
+      process.on("exit", (code) => {
+        resolve({ exitCode: code, stdout, stderr });
+      });
+    });
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private toDiscoverPathArg(folder: vscode.WorkspaceFolder, filePath: string): string {
+    const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(folder.uri.fsPath, filePath);
+    const relativePath = path.relative(folder.uri.fsPath, absolutePath);
+    if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+      return relativePath;
+    }
+
+    return absolutePath;
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private parsePrefilterFileList(stdout: string): string[] {
+    if (!stdout) return [];
+    if (stdout.includes("\0")) {
+      return stdout
+        .split("\0")
+        .map((v) => v.trim())
+        .filter((v) => v.length > 0);
+    }
+    return stdout
+      .split(/\r?\n/)
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0);
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private normalizeRootForSearch(folder: vscode.WorkspaceFolder, root: string): string | undefined {
+    const normalizedRoot = root.trim();
+    if (!normalizedRoot) return undefined;
+    if (!path.isAbsolute(normalizedRoot)) return normalizedRoot;
+
+    const relativeRoot = path.relative(folder.uri.fsPath, normalizedRoot);
+    if (!relativeRoot || relativeRoot.startsWith("..")) return undefined;
+    return relativeRoot;
+  }
+
+  private async prefilterWithGitGrep(
+    folder: vscode.WorkspaceFolder,
+    roots: string[],
+    token?: vscode.CancellationToken,
+  ): Promise<string[] | undefined> {
+    const fileExtensions = this.languageClientsManager.fileExtensions;
+    const normalizedRoots = roots
+      .map((v) => this.normalizeRootForSearch(folder, v))
+      .filter((v) => v !== undefined)
+      .map((v) => v.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, ""));
+    if (normalizedRoots.length === 0) return [];
+    const pathSpecs = normalizedRoots.flatMap((root) =>
+      fileExtensions.map((ext) => `:(glob)${root.length > 0 && root !== "." ? `${root}/` : ""}**/*.${ext}`),
+    );
+
+    const result = await this.runShellCommand(
+      "git",
+      ["grep", "-z", "-l", "-E", "^\\*\\*\\*\\s*(Test Cases|Tasks)\\s*\\*\\*\\*\\s*$", "--", ...pathSpecs],
+      folder.uri.fsPath,
+      token,
+    );
+
+    if (result.error !== undefined) {
+      this.outputChannel.appendLine(
+        `fast discovery: git grep unavailable (${result.error?.toString() ?? "unknown error"})`,
+      );
+      return undefined;
+    }
+
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      this.outputChannel.appendLine(
+        `fast discovery: git grep failed with exit code ${result.exitCode?.toString() ?? "null"}: ${result.stderr}`,
+      );
+      return undefined;
+    }
+
+    return this.parsePrefilterFileList(result.stdout).map((v) => this.toDiscoverPathArg(folder, v));
+  }
+
+  private async prefilterWithGrep(
+    folder: vscode.WorkspaceFolder,
+    roots: string[],
+    token?: vscode.CancellationToken,
+  ): Promise<string[] | undefined> {
+    const normalizedRoots = roots.map((v) => this.normalizeRootForSearch(folder, v)).filter((v) => v !== undefined);
+    if (normalizedRoots.length === 0) return [];
+
+    const includeArgs = this.languageClientsManager.fileExtensions.map((ext) => `--include=*.${ext}`);
+    const result = await this.runShellCommand(
+      "grep",
+      ["-RIlE", "-Z", "^\\*\\*\\*\\s*(Test Cases|Tasks)\\s*\\*\\*\\*\\s*$", ...includeArgs, ...normalizedRoots],
+      folder.uri.fsPath,
+      token,
+    );
+
+    if (result.error !== undefined) {
+      this.outputChannel.appendLine(
+        `fast discovery: grep unavailable (${result.error?.toString() ?? "unknown error"})`,
+      );
+      return undefined;
+    }
+
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      this.outputChannel.appendLine(
+        `fast discovery: grep failed with exit code ${result.exitCode?.toString() ?? "null"}: ${result.stderr}`,
+      );
+      return undefined;
+    }
+
+    return this.parsePrefilterFileList(result.stdout).map((v) => this.toDiscoverPathArg(folder, v));
+  }
+
+  private async getFastDiscoveryCandidates(
+    folder: vscode.WorkspaceFolder,
+    token?: vscode.CancellationToken,
+  ): Promise<string[] | undefined> {
+    if (!this.isFastDiscoveryEnabled(folder)) return undefined;
+
+    const roots = this.getFastDiscoveryRoots(folder);
+    const prefilterMode = this.getFastDiscoveryPrefilterCommand(folder);
+    this.outputChannel.appendLine(
+      `fast discovery: start workspace=${folder.name} mode=${prefilterMode} roots=${roots.join(",")}`,
+    );
+
+    const runGit = async () => await this.prefilterWithGitGrep(folder, roots, token);
+    const runGrep = async () => await this.prefilterWithGrep(folder, roots, token);
+
+    let files: string[] | undefined;
+
+    switch (prefilterMode) {
+      case "gitGrep":
+        files = await runGit();
+        break;
+      case "grep":
+        files = await runGrep();
+        break;
+      case "none":
+        return undefined;
+      case "auto":
+      default:
+        files = (await runGit()) ?? (await runGrep());
+        break;
+    }
+
+    if (files === undefined) return undefined;
+
+    this.outputChannel.appendLine(
+      `fast discovery: prefilter mode=${prefilterMode} candidates=${files.length} in workspace ${folder.name}`,
+    );
+    return files;
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private isLegacyDiscoverStdinFormatError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const message = error.message ?? "";
+    return (
+      message.includes('Invalid value for "documents"') ||
+      message.includes("must be of type `<class 'str'>` but is `dict`")
+    );
+  }
 
   public async getTestsFromWorkspaceFolder(
     folder: vscode.WorkspaceFolder,
@@ -819,18 +1061,86 @@ export class TestControllerManager {
         }
       }
 
-      const result = await this.discoverTests(
-        folder,
-        ["discover", "--read-from-stdin", "all"],
-        [],
-        JSON.stringify(o),
-        true,
-        token,
-      );
+      const fastDiscoveryCandidates = await this.getFastDiscoveryCandidates(folder, token);
+      if (token?.isCancellationRequested) return undefined;
 
-      this.lastDiscoverResults.set(folder, result);
+      const useFastDiscoveryCommand =
+        fastDiscoveryCandidates !== undefined && this.isFastDiscoveryCommandEnabled(folder);
+      const initialDiscoverSubCommand = useFastDiscoveryCommand ? "fast" : "all";
 
-      return result?.items;
+      if (fastDiscoveryCandidates !== undefined && fastDiscoveryCandidates.length === 0) {
+        this.lastDiscoverResults.set(folder, { items: [] });
+        return [];
+      }
+
+      const fullStdioData = JSON.stringify(o);
+      const prefilteredStdioData =
+        fastDiscoveryCandidates !== undefined
+          ? JSON.stringify({ documents: o, candidates: fastDiscoveryCandidates })
+          : fullStdioData;
+
+      const runWorkspaceDiscover = async (
+        subCommand: "all" | "fast",
+        extraArgs: string[],
+        stdioData: string,
+      ): Promise<RobotCodeDiscoverResult> =>
+        await this.discoverTests(
+          folder,
+          ["discover", "--read-from-stdin", subCommand],
+          extraArgs,
+          stdioData,
+          true,
+          token,
+        );
+
+      const runWorkspaceDiscoverWithLegacyRetry = async (
+        subCommand: "all" | "fast",
+      ): Promise<RobotCodeDiscoverResult> => {
+        try {
+          return await runWorkspaceDiscover(subCommand, [], prefilteredStdioData);
+        } catch (error) {
+          if (fastDiscoveryCandidates !== undefined && this.isLegacyDiscoverStdinFormatError(error)) {
+            this.outputChannel.appendLine(
+              "fast discovery: stdin candidates payload not supported by bundled runner, retrying with legacy argv candidates",
+            );
+            return await runWorkspaceDiscover(subCommand, fastDiscoveryCandidates, fullStdioData);
+          }
+          throw error;
+        }
+      };
+
+      let result: RobotCodeDiscoverResult;
+      try {
+        result = await runWorkspaceDiscoverWithLegacyRetry(initialDiscoverSubCommand);
+      } catch (error) {
+        if (useFastDiscoveryCommand) {
+          this.outputChannel.appendLine(
+            `fast discovery: discover ${initialDiscoverSubCommand} failed, retrying discover all (${(error as Error).message ?? String(error)})`,
+          );
+          result = await runWorkspaceDiscoverWithLegacyRetry("all");
+        } else {
+          throw error;
+        }
+      }
+
+      let finalResult = result;
+      if (fastDiscoveryCandidates !== undefined && (result?.items?.length ?? 0) === 0) {
+        this.outputChannel.appendLine(
+          `fast discovery: empty result for workspace=${folder.name}, rerunning full discovery without prefilter candidates`,
+        );
+        finalResult = await this.discoverTests(
+          folder,
+          ["discover", "--read-from-stdin", "all"],
+          [],
+          fullStdioData,
+          true,
+          token,
+        );
+      }
+
+      this.lastDiscoverResults.set(folder, finalResult);
+
+      return finalResult?.items;
     } catch (e) {
       if (e instanceof Error) {
         if (e.name === "AbortError") {

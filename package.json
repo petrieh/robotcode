@@ -1300,6 +1300,30 @@
             "default": true,
             "description": "Enable/disable whether Robot Framework tests and tasks are integrated into the VSCode Test/Test Explorer view.",
             "scope": "resource"
+          },
+          "robotcode.testExplorer.fastDiscovery.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Experimental optimization for very large workspaces. Prefilters files containing Test Cases/Tasks before full discovery.",
+            "scope": "resource"
+          },
+          "robotcode.testExplorer.fastDiscovery.prefilterCommand": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "gitGrep",
+              "grep",
+              "none"
+            ],
+            "default": "auto",
+            "markdownDescription": "Selects prefilter command for fast discovery. `auto` tries `git grep` first, then `grep`, and falls back to normal discovery if unavailable. `none` disables prefiltering.",
+            "scope": "resource"
+          },
+          "robotcode.testExplorer.fastDiscovery.command.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Use `robotcode discover fast` for workspace discovery when fast discovery prefiltering is enabled. Automatically falls back to full discovery if unsupported options are detected.",
+            "scope": "resource"
           }
         }
       }

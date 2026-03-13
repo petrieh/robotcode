@@ -189,7 +189,9 @@ export class PythonManager {
       noPager,
     );
 
-    this.outputChannel.appendLine(`executeRobotCode: ${pythonCommand} ${final_args.join(" ")}`);
+    this.outputChannel.appendLine(`executeRobotCode: cwd=${folder.uri.fsPath}`);
+    this.outputChannel.appendLine(`executeRobotCode: command=${pythonCommand}`);
+    this.outputChannel.appendLine(`executeRobotCode: args=${JSON.stringify(final_args)}`);
 
     return new Promise((resolve, reject) => {
       const abortController = new AbortController();
@@ -235,8 +237,13 @@ export class PythonManager {
         this.outputChannel.appendLine(`executeRobotCode: exit code ${code ?? "null"}`);
         if (code === 0) {
           try {
-            resolve(JSON.parse(stdout));
+            resolve(this.parseJsonOutput(stdout));
           } catch (err) {
+            const head = stdout.slice(0, 1000);
+            const tail = stdout.slice(-1000);
+            this.outputChannel.appendLine(
+              `executeRobotCode: invalid json output length=${stdout.length} head:\n${head}\n...tail:\n${tail}`,
+            );
             reject(err);
           }
         } else {
@@ -246,6 +253,95 @@ export class PythonManager {
         }
       });
     });
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  private parseJsonOutput(stdout: string): unknown {
+    const text = stdout
+      .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "")
+      .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, "")
+      .replace(/\u0000/g, "")
+      .trim();
+    if (!text) {
+      throw new Error("Executing robotcode failed: empty json output.");
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      const starts: number[] = [];
+      let bestParsedValue: unknown | undefined;
+      let bestParsedLength = -1;
+      for (let i = 0; i < text.length; i += 1) {
+        if (text[i] === "{" || text[i] === "[") {
+          starts.push(i);
+        }
+      }
+
+      for (const start of starts) {
+        const stack: string[] = [];
+        let inString = false;
+        let escaped = false;
+        let parsedValue: unknown | undefined;
+        for (let i = start; i < text.length; i += 1) {
+          const ch = text[i];
+          if (inString) {
+            if (escaped) {
+              escaped = false;
+            } else if (ch === "\\") {
+              escaped = true;
+            } else if (ch === '"') {
+              inString = false;
+            }
+            continue;
+          }
+
+          if (ch === '"') {
+            inString = true;
+            continue;
+          }
+          if (ch === "{") {
+            stack.push("}");
+            continue;
+          }
+          if (ch === "[") {
+            stack.push("]");
+            continue;
+          }
+          if (ch === "}" || ch === "]") {
+            if (stack.length === 0) break;
+            const expected = stack.pop();
+            if (expected !== ch) break;
+            if (stack.length === 0) {
+              const candidate = text.slice(start, i + 1);
+              try {
+                parsedValue = JSON.parse(candidate);
+              } catch {
+                parsedValue = undefined;
+              }
+              if (parsedValue !== undefined) {
+                const remaining = text.slice(i + 1).trim();
+                if (remaining.length === 0) {
+                  return parsedValue;
+                }
+                if (candidate.length > bestParsedLength) {
+                  bestParsedValue = parsedValue;
+                  bestParsedLength = candidate.length;
+                }
+              }
+              continue;
+            }
+          }
+        }
+      }
+
+      if (bestParsedValue !== undefined) {
+        return bestParsedValue;
+      }
+
+      const sample = text.slice(0, 500);
+      throw new Error(`Executing robotcode failed: output did not contain parseable JSON. Sample: ${sample}`);
+    }
   }
 
   public async buildRobotCodeCommand(
