@@ -1,9 +1,12 @@
+import json
 import os
 import platform
 import re
 import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from io import IOBase
 from pathlib import Path
 from typing import (
@@ -13,15 +16,17 @@ from typing import (
     List,
     MutableMapping,
     Optional,
+    Set,
     Tuple,
     Union,
 )
 
 import click
+from robot.api import Token, get_tokens
 import robot.running.model as running_model
 from robot.conf import RobotSettings
 from robot.errors import DATA_ERROR, INFO_PRINTED, DataError, Information
-from robot.model import ModelModifier, TestCase, TestSuite
+from robot.model import ModelModifier, TagPatterns, TestCase, TestSuite
 from robot.model.visitor import SuiteVisitor
 from robot.output import LOGGER, Message
 from robot.running.builder import TestSuiteBuilder
@@ -39,7 +44,7 @@ from robotcode.core.lsp.types import (
 )
 from robotcode.core.uri import Uri
 from robotcode.core.utils.cli import show_hidden_arguments
-from robotcode.core.utils.dataclasses import CamelSnakeMixin, from_json
+from robotcode.core.utils.dataclasses import CamelSnakeMixin, as_dict, as_json
 from robotcode.core.utils.path import normalized_path
 from robotcode.plugin import (
     Application,
@@ -62,7 +67,50 @@ __patched = False
 
 
 _stdin_data: Optional[Dict[Uri, str]] = None
+_stdin_candidates: Optional[List[str]] = None
 _app: Optional[Application] = None
+_discover_log_visited_files = os.getenv("ROBOTCODE_DISCOVER_LOG_VISITED_FILES", "").lower() in [
+    "on",
+    "1",
+    "yes",
+    "true",
+]
+_discover_run_empty_suite = True
+_FAST_DISCOVERY_UNSUPPORTED_OPTION_PREFIXES = (
+    "--parser",
+    "--prerunmodifier",
+    "-PARSER",
+)
+_FAST_DISCOVERY_PROGRESS_INTERVAL = 200
+_FAST_DISCOVERY_SLOW_FILE_THRESHOLD_S = 2.0
+
+
+def _emit_fast_discovery_log(message: str) -> None:
+    if _app is not None:
+        _app.verbose(message)
+
+
+def _prune_empty_test_items(items: Optional[List["TestItem"]]) -> List["TestItem"]:
+    if not items:
+        return []
+
+    result: List["TestItem"] = []
+    for item in items:
+        if item.children is not None:
+            item.children = _prune_empty_test_items(item.children)
+
+        if item.type in ("test", "task", "error"):
+            result.append(item)
+            continue
+
+        if item.children:
+            result.append(item)
+            continue
+
+        if item.error:
+            result.append(item)
+
+    return result
 
 
 def _patch() -> None:
@@ -235,6 +283,815 @@ class Statistics(CamelSnakeMixin):
     tasks: int = 0
 
 
+def _fast_match(value: str, pattern: str) -> bool:
+    return fnmatchcase(normalize(value, ignore="_"), normalize(pattern, ignore="_"))
+
+
+def _compose_fast_longname(parent: TestItem, child_name: str) -> str:
+    if parent.type == "workspace":
+        return child_name
+    return f"{parent.longname}.{child_name}"
+
+
+def _get_robot_option_values(robot_options_and_args: Tuple[str, ...], *option_names: str) -> List[str]:
+    result: List[str] = []
+    option_names_set = set(option_names)
+    i = 0
+    while i < len(robot_options_and_args):
+        arg = robot_options_and_args[i]
+        if arg in option_names_set:
+            if i + 1 < len(robot_options_and_args):
+                result.append(robot_options_and_args[i + 1])
+                i += 2
+                continue
+        else:
+            for name in option_names:
+                if arg.startswith(f"{name}="):
+                    result.append(arg[len(name) + 1 :])
+                    break
+        i += 1
+    return result
+
+
+def _has_fast_discovery_unsupported_options(cmd_options: List[str], robot_options_and_args: Tuple[str, ...]) -> Optional[str]:
+    all_options = [*cmd_options, *robot_options_and_args]
+    for option in all_options:
+        option_l = option.lower()
+        if any(
+            option_l == prefix.lower() or option_l.startswith(f"{prefix.lower()}=")
+            for prefix in _FAST_DISCOVERY_UNSUPPORTED_OPTION_PREFIXES
+        ):
+            return option
+    return None
+
+
+def _get_fast_discovery_suffixes(cmd_options: List[str], robot_options_and_args: Tuple[str, ...]) -> Set[str]:
+    extensions = _get_robot_option_values(tuple([*cmd_options, *robot_options_and_args]), "--extension", "-F")
+    suffixes = {f".{e.strip().lstrip('.').lower()}" for e in extensions if e.strip()}
+    if not suffixes:
+        suffixes = {".robot"}
+    suffixes.add(".resource")
+    return suffixes
+
+
+def _get_fast_discovery_tag_patterns(
+    cmd_options: List[str], robot_options_and_args: Tuple[str, ...]
+) -> Tuple[Optional[TagPatterns], Optional[TagPatterns]]:
+    all_options = tuple([*cmd_options, *robot_options_and_args])
+    include_tags = _get_robot_option_values(all_options, "--include", "-i")
+    exclude_tags = _get_robot_option_values(all_options, "--exclude", "-e")
+    include_patterns = TagPatterns(include_tags) if include_tags else None
+    exclude_patterns = TagPatterns(exclude_tags) if exclude_tags else None
+    return include_patterns, exclude_patterns
+
+
+def _fast_match_tags(
+    tags: Iterable[str], include_patterns: Optional[TagPatterns], exclude_patterns: Optional[TagPatterns]
+) -> bool:
+    if include_patterns and not include_patterns.match(tags):
+        return False
+    if exclude_patterns and exclude_patterns.match(tags):
+        return False
+    return True
+
+
+def _resolve_fast_candidate_path(candidate: str, root_folder: Optional[Path]) -> Path:
+    candidate_path = Path(candidate)
+    if not candidate_path.is_absolute():
+        candidate_path = (root_folder or Path.cwd()) / candidate_path
+    return normalized_path(candidate_path)
+
+
+def _is_allowed_fast_candidate(path: Path, root_folder: Optional[Path], app: Application) -> bool:
+    if not path.is_file():
+        return False
+
+    return any(
+        p == path
+        for p in iter_files(
+            path,
+            root=root_folder,
+            ignore_files=[ROBOT_IGNORE_FILE, GIT_IGNORE_FILE],
+            include_hidden=False,
+        )
+    )
+
+
+def _iter_fast_discovery_files(
+    app: Application,
+    root_folder: Optional[Path],
+    profile: Any,
+    candidates: Optional[List[str]],
+    allowed_suffixes: Set[str],
+) -> List[Path]:
+    if candidates:
+        result = []
+        for candidate in candidates:
+            p = _resolve_fast_candidate_path(candidate, root_folder)
+            if p.suffix.lower() in allowed_suffixes and _is_allowed_fast_candidate(p, root_folder, app):
+                result.append(p)
+        return sorted(set(result))
+
+    search_paths = set(
+        (
+            [*(app.config.default_paths if app.config.default_paths else ())]
+            if profile.paths is None
+            else profile.paths
+            if isinstance(profile.paths, list)
+            else [profile.paths]
+        )
+    )
+    if not search_paths:
+        search_paths = {"."}
+
+    return sorted(
+        set(
+            p
+            for p in iter_files(
+                (Path(s) for s in search_paths),
+                root=root_folder,
+                ignore_files=[ROBOT_IGNORE_FILE, GIT_IGNORE_FILE],
+                include_hidden=False,
+                verbose_callback=app.verbose,
+            )
+            if p.suffix.lower() in allowed_suffixes
+        )
+    )
+
+
+def _extract_force_tags_from_path(path: Path) -> List[str]:
+    result: List[str] = []
+    current_section: Optional[str] = None
+    token_source = _get_token_source_for_path(path)
+    collect_continuation = False
+
+    for statement_tokens in _iter_statements(token_source):
+        first = statement_tokens[0]
+        if first.type == Token.SETTING_HEADER:
+            current_section = Token.SETTING_HEADER
+            collect_continuation = False
+            continue
+        if first.type in Token.HEADER_TOKENS:
+            current_section = first.type
+            collect_continuation = False
+            continue
+        if current_section != Token.SETTING_HEADER:
+            continue
+
+        if first.type == Token.FORCE_TAGS:
+            result.extend(str(t).strip() for t in statement_tokens[1:] if str(t).strip())
+            collect_continuation = True
+            continue
+
+        if collect_continuation and first.type == Token.ARGUMENT:
+            result.extend(str(t).strip() for t in statement_tokens if str(t).strip())
+            continue
+
+        collect_continuation = False
+
+    return list(dict.fromkeys(result))
+
+
+def _get_token_source_for_path(path: Path) -> Union[str, Path]:
+    if _stdin_data is not None:
+        uri = str(Uri.from_path(path))
+        stdin_text = _stdin_data.get(Uri(uri).normalized())
+        if stdin_text is not None:
+            return stdin_text
+    return path
+
+
+def _iter_statements(token_source: Union[str, Path]) -> Iterable[List[Token]]:
+    statement: List[Token] = []
+
+    try:
+        tokens = get_tokens(token_source)
+    except (OSError, UnicodeDecodeError):
+        return
+
+    for token in tokens:
+        if token.type == Token.EOS:
+            if statement:
+                yield statement
+                statement = []
+            continue
+        if token.type in Token.NON_DATA_TOKENS:
+            continue
+
+        statement.append(token)
+
+    if statement:
+        yield statement
+
+
+def _get_cached_force_tags_for_file(
+    path: Path,
+    force_tags_cache: Dict[Path, List[str]],
+) -> List[str]:
+    if path not in force_tags_cache:
+        force_tags_cache[path] = _extract_force_tags_from_path(path)
+    return force_tags_cache[path]
+
+
+def _get_cached_inherited_force_tags(
+    file_path: Path,
+    workspace_path: Path,
+    force_tags_cache: Dict[Path, List[str]],
+    inherited_cache: Dict[Path, List[str]],
+) -> List[str]:
+    if file_path in inherited_cache:
+        return inherited_cache[file_path]
+
+    aggregated: List[str] = []
+
+    current_dir = file_path.parent
+    while True:
+        init_file = current_dir / "__init__.robot"
+        if init_file != file_path and init_file.is_file():
+            aggregated.extend(_get_cached_force_tags_for_file(init_file, force_tags_cache))
+
+        if current_dir == workspace_path or current_dir.parent == current_dir:
+            break
+        current_dir = current_dir.parent
+
+    aggregated.extend(_get_cached_force_tags_for_file(file_path, force_tags_cache))
+    inherited_cache[file_path] = list(dict.fromkeys(aggregated))
+    return inherited_cache[file_path]
+
+
+def _extract_fast_items_from_path(path: Path) -> List[Tuple[str, str, int, List[str]]]:
+    result: List[Tuple[str, str, int, List[str]]] = []
+    current_section: Optional[str] = None
+    task_header = getattr(Token, "TASK_HEADER", None)
+    token_source = _get_token_source_for_path(path)
+    current_item_index: Optional[int] = None
+    collect_tag_continuation = False
+
+    for row_tokens in _iter_statements(token_source):
+        first = row_tokens[0]
+        if first.type == Token.TESTCASE_HEADER:
+            current_section = "test"
+            current_item_index = None
+            collect_tag_continuation = False
+            continue
+        if task_header is not None and first.type == task_header:
+            current_section = "task"
+            current_item_index = None
+            collect_tag_continuation = False
+            continue
+        if first.type in Token.HEADER_TOKENS:
+            current_section = None
+            current_item_index = None
+            collect_tag_continuation = False
+            continue
+        if current_section is None:
+            continue
+
+        if first.type == Token.TESTCASE_NAME:
+            name = str(first).strip()
+            if name:
+                result.append((current_section, name, first.lineno, []))
+                current_item_index = len(result) - 1
+            collect_tag_continuation = False
+            continue
+
+        if current_item_index is None:
+            continue
+
+        _, _, _, current_tags = result[current_item_index]
+
+        if first.type == Token.TAGS:
+            current_tags.extend(str(t).strip() for t in row_tokens[1:] if str(t).strip())
+            collect_tag_continuation = True
+            continue
+
+        if collect_tag_continuation and first.type == Token.ARGUMENT:
+            current_tags.extend(str(t).strip() for t in row_tokens if str(t).strip())
+            continue
+
+        collect_tag_continuation = False
+
+    for i, (item_type, name, lineno, tags) in enumerate(result):
+        if tags:
+            result[i] = (item_type, name, lineno, list(dict.fromkeys(tags)))
+
+    return result
+
+
+def _build_fast_discovery_result(
+    app: Application,
+    by_longname: Tuple[str, ...],
+    exclude_by_longname: Tuple[str, ...],
+    robot_options_and_args: Tuple[str, ...],
+) -> ResultItem:
+    started = time.perf_counter()
+    root_folder, profile, cmd_options = handle_robot_options(app, robot_options_and_args)
+    after_handle_options = time.perf_counter()
+
+    if unsupported_option := _has_fast_discovery_unsupported_options(cmd_options, robot_options_and_args):
+        raise click.ClickException(
+            f"Fast discovery does not support option '{unsupported_option}'. Use 'discover all' instead."
+        )
+
+    suite_filters = _get_robot_option_values(robot_options_and_args, "--suite")
+    test_filters = _get_robot_option_values(robot_options_and_args, "--test")
+    allowed_suffixes = _get_fast_discovery_suffixes(cmd_options, robot_options_and_args)
+    all_options = tuple([*cmd_options, *robot_options_and_args])
+    include_tag_filters = _get_robot_option_values(all_options, "--include", "-i")
+    exclude_tag_filters = _get_robot_option_values(all_options, "--exclude", "-e")
+    include_tag_patterns, exclude_tag_patterns = _get_fast_discovery_tag_patterns(cmd_options, robot_options_and_args)
+
+    app.verbose(
+        lambda: (
+            "discover fast filters: "
+            f"include_tags={include_tag_filters} exclude_tags={exclude_tag_filters} "
+            f"suite_filters={suite_filters} test_filters={test_filters}"
+        )
+    )
+
+    workspace_path = Path.cwd()
+    workspace_item = TestItem(
+        type="workspace",
+        id=str(workspace_path),
+        name=workspace_path.name,
+        longname=workspace_path.name,
+        uri=str(Uri.from_path(workspace_path)),
+        source=str(workspace_path),
+        rel_source=get_rel_source(workspace_path),
+        needs_parse_include=RF_VERSION >= (6, 1),
+        children=[],
+    )
+
+    suite_by_id: Dict[str, TestItem] = {workspace_item.id: workspace_item}
+    files = _iter_fast_discovery_files(app, root_folder, profile, _stdin_candidates, allowed_suffixes)
+    after_collect_files = time.perf_counter()
+    force_tags_cache: Dict[Path, List[str]] = {}
+    inherited_force_tags_cache: Dict[Path, List[str]] = {}
+    tests_count = 0
+    tasks_count = 0
+    total_file_scan_seconds = 0.0
+    total_tag_entries = 0
+    total_tag_chars = 0
+    max_tags_per_item = 0
+    max_tag_chars_per_item = 0
+    max_longname_len = 0
+    max_source_len = 0
+
+    _emit_fast_discovery_log(
+        "discover fast: "
+        f"files={len(files)} candidates={len(_stdin_candidates or [])} "
+        f"suite_filters={len(suite_filters)} test_filters={len(test_filters)}"
+    )
+
+    for index, file_path in enumerate(files, start=1):
+        file_started = time.perf_counter()
+        rel_parts = file_path.parts
+        try:
+            rel_parts = file_path.relative_to(workspace_path).parts
+        except ValueError:
+            pass
+
+        parent = workspace_item
+        current_dir = workspace_path
+        for part in rel_parts[:-1]:
+            current_dir = current_dir / part
+            suite_name = TestSuite.name_from_source(current_dir)
+            suite_longname = _compose_fast_longname(parent, suite_name)
+            suite_id = f"{current_dir};{suite_longname}"
+            suite_item = suite_by_id.get(suite_id)
+            if suite_item is None:
+                suite_item = TestItem(
+                    type="suite",
+                    id=suite_id,
+                    name=suite_name,
+                    longname=suite_longname,
+                    uri=str(Uri.from_path(current_dir)),
+                    source=str(current_dir),
+                    rel_source=get_rel_source(current_dir),
+                    needs_parse_include=RF_VERSION >= (6, 1),
+                    children=[],
+                    rpa=False,
+                )
+                parent.children = parent.children or []
+                parent.children.append(suite_item)
+                suite_by_id[suite_id] = suite_item
+            parent = suite_item
+
+        if file_path.name.lower() == "__init__.robot":
+            target_suite = parent
+        else:
+            suite_name = TestSuite.name_from_source(file_path)
+            suite_longname = _compose_fast_longname(parent, suite_name)
+            suite_id = f"{file_path};{suite_longname}"
+            suite_item = suite_by_id.get(suite_id)
+            if suite_item is None:
+                suite_item = TestItem(
+                    type="suite",
+                    id=suite_id,
+                    name=suite_name,
+                    longname=suite_longname,
+                    uri=str(Uri.from_path(file_path)),
+                    source=str(file_path),
+                    rel_source=get_rel_source(file_path),
+                    range=Range(start=Position(line=0, character=0), end=Position(line=0, character=0)),
+                    needs_parse_include=RF_VERSION >= (6, 1),
+                    children=[],
+                    rpa=False,
+                )
+                parent.children = parent.children or []
+                parent.children.append(suite_item)
+                suite_by_id[suite_id] = suite_item
+            target_suite = suite_item
+
+        if suite_filters and not any(_fast_match(target_suite.longname, f) for f in suite_filters):
+            continue
+        if by_longname and not any(_fast_match(target_suite.longname, f) for f in by_longname):
+            continue
+        if exclude_by_longname and any(_fast_match(target_suite.longname, f) for f in exclude_by_longname):
+            continue
+
+        inherited_force_tags = _get_cached_inherited_force_tags(
+            file_path, workspace_path, force_tags_cache, inherited_force_tags_cache
+        )
+        extracted_items = _extract_fast_items_from_path(file_path)
+        for item_type, test_name, lineno, test_tags in extracted_items:
+            combined_tags = list(dict.fromkeys([*inherited_force_tags, *test_tags]))
+            if not _fast_match_tags(combined_tags, include_tag_patterns, exclude_tag_patterns):
+                continue
+
+            longname = _compose_fast_longname(target_suite, test_name)
+            if test_filters and not any(_fast_match(longname, f) for f in test_filters):
+                continue
+            if by_longname and not any(_fast_match(longname, f) for f in by_longname):
+                continue
+            if exclude_by_longname and any(_fast_match(longname, f) for f in exclude_by_longname):
+                continue
+
+            if item_type == "task":
+                target_suite.rpa = True
+                tasks_count += 1
+            else:
+                tests_count += 1
+
+            tag_count = len(combined_tags)
+            tag_chars = sum(len(tag) for tag in combined_tags)
+            total_tag_entries += tag_count
+            total_tag_chars += tag_chars
+            max_tags_per_item = max(max_tags_per_item, tag_count)
+            max_tag_chars_per_item = max(max_tag_chars_per_item, tag_chars)
+
+            child = TestItem(
+                type=item_type,
+                id=f"{file_path};{longname};{lineno}",
+                name=test_name,
+                longname=longname,
+                lineno=lineno,
+                uri=str(Uri.from_path(file_path)),
+                source=str(file_path),
+                rel_source=get_rel_source(file_path),
+                range=Range(
+                    start=Position(line=lineno - 1, character=0),
+                    end=Position(line=lineno - 1, character=0),
+                ),
+                tags=combined_tags if combined_tags else None,
+                rpa=item_type == "task",
+            )
+            max_longname_len = max(max_longname_len, len(longname))
+            max_source_len = max(max_source_len, len(str(file_path)))
+            target_suite.children = target_suite.children or []
+            target_suite.children.append(child)
+
+        file_elapsed = time.perf_counter() - file_started
+        total_file_scan_seconds += file_elapsed
+        if file_elapsed >= _FAST_DISCOVERY_SLOW_FILE_THRESHOLD_S:
+            _emit_fast_discovery_log(
+                f"discover fast: slow file elapsed={file_elapsed:.3f}s extracted={len(extracted_items)} path={file_path}"
+            )
+
+        if index % _FAST_DISCOVERY_PROGRESS_INTERVAL == 0:
+            elapsed = time.perf_counter() - started
+            _emit_fast_discovery_log(
+                f"discover fast: progress files={index}/{len(files)} tests={tests_count} tasks={tasks_count} elapsed={elapsed:.3f}s"
+            )
+
+    completed = time.perf_counter()
+    _emit_fast_discovery_log(
+        "discover fast timings (s): "
+        f"handle_options={after_handle_options - started:.3f}, "
+        f"collect_files={after_collect_files - after_handle_options:.3f}, "
+        f"scan_files={total_file_scan_seconds:.3f}, "
+        f"total={completed - started:.3f}"
+    )
+    _emit_fast_discovery_log(
+        "discover fast payload stats: "
+        f"tests={tests_count} tasks={tasks_count} suites={len(suite_by_id)} "
+        f"total_tag_entries={total_tag_entries} total_tag_chars={total_tag_chars} "
+        f"max_tags_per_item={max_tags_per_item} max_tag_chars_per_item={max_tag_chars_per_item} "
+        f"max_longname_len={max_longname_len} max_source_len={max_source_len}"
+    )
+
+    app.verbose(
+        lambda: (
+            "discover fast summary: "
+            f"files={len(files)} tests={tests_count} tasks={tasks_count} "
+            f"candidates={len(_stdin_candidates or [])}"
+        )
+    )
+
+    if not _discover_run_empty_suite:
+        workspace_item.children = _prune_empty_test_items(workspace_item.children)
+
+    return ResultItem([workspace_item], diagnostics=None)
+
+
+def _write_incremental_discover_event(event: Dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(event, separators=(",", ":")))
+    sys.stdout.write(os.linesep)
+
+
+def _stream_fast_discovery_result(
+    app: Application,
+    by_longname: Tuple[str, ...],
+    exclude_by_longname: Tuple[str, ...],
+    robot_options_and_args: Tuple[str, ...],
+) -> None:
+    started = time.perf_counter()
+    root_folder, profile, cmd_options = handle_robot_options(app, robot_options_and_args)
+    after_handle_options = time.perf_counter()
+
+    if unsupported_option := _has_fast_discovery_unsupported_options(cmd_options, robot_options_and_args):
+        raise click.ClickException(
+            f"Fast discovery does not support option '{unsupported_option}'. Use 'discover all' instead."
+        )
+
+    suite_filters = _get_robot_option_values(robot_options_and_args, "--suite")
+    test_filters = _get_robot_option_values(robot_options_and_args, "--test")
+    allowed_suffixes = _get_fast_discovery_suffixes(cmd_options, robot_options_and_args)
+    all_options = tuple([*cmd_options, *robot_options_and_args])
+    include_tag_filters = _get_robot_option_values(all_options, "--include", "-i")
+    exclude_tag_filters = _get_robot_option_values(all_options, "--exclude", "-e")
+    include_tag_patterns, exclude_tag_patterns = _get_fast_discovery_tag_patterns(cmd_options, robot_options_and_args)
+
+    app.verbose(
+        lambda: (
+            "discover fast filters: "
+            f"include_tags={include_tag_filters} exclude_tags={exclude_tag_filters} "
+            f"suite_filters={suite_filters} test_filters={test_filters}"
+        )
+    )
+
+    workspace_path = Path.cwd()
+    workspace_item = TestItem(
+        type="workspace",
+        id=str(workspace_path),
+        name=workspace_path.name,
+        longname=workspace_path.name,
+        uri=str(Uri.from_path(workspace_path)),
+        source=str(workspace_path),
+        rel_source=get_rel_source(workspace_path),
+        needs_parse_include=RF_VERSION >= (6, 1),
+    )
+
+    app.verbose("discover output: incremental stream start")
+    write_started = time.perf_counter()
+    _write_incremental_discover_event({"event": "start", "version": 1})
+    _write_incremental_discover_event(
+        {
+            "event": "item",
+            "item": as_dict(workspace_item, remove_defaults=True),
+        }
+    )
+
+    stream_empty_suites = _discover_run_empty_suite
+    suite_by_id: Dict[str, TestItem] = {workspace_item.id: workspace_item}
+    suite_parent_by_id: Dict[str, Optional[str]] = {workspace_item.id: None}
+    emitted_suite_ids: Set[str] = {workspace_item.id}
+
+    def emit_suite_if_needed(suite_id: str) -> None:
+        if suite_id in emitted_suite_ids:
+            return
+
+        suite_item = suite_by_id.get(suite_id)
+        if suite_item is None:
+            return
+
+        parent_id = suite_parent_by_id.get(suite_id)
+        if parent_id is not None:
+            emit_suite_if_needed(parent_id)
+
+        _write_incremental_discover_event(
+            {
+                "event": "item",
+                "item": as_dict(suite_item, remove_defaults=True),
+                "parentId": parent_id,
+            }
+        )
+        emitted_suite_ids.add(suite_id)
+
+    files = _iter_fast_discovery_files(app, root_folder, profile, _stdin_candidates, allowed_suffixes)
+    after_collect_files = time.perf_counter()
+    force_tags_cache: Dict[Path, List[str]] = {}
+    inherited_force_tags_cache: Dict[Path, List[str]] = {}
+    tests_count = 0
+    tasks_count = 0
+    total_file_scan_seconds = 0.0
+    total_tag_entries = 0
+    total_tag_chars = 0
+    max_tags_per_item = 0
+    max_tag_chars_per_item = 0
+    max_longname_len = 0
+    max_source_len = 0
+
+    _emit_fast_discovery_log(
+        "discover fast: "
+        f"files={len(files)} candidates={len(_stdin_candidates or [])} "
+        f"suite_filters={len(suite_filters)} test_filters={len(test_filters)}"
+    )
+
+    for index, file_path in enumerate(files, start=1):
+        file_started = time.perf_counter()
+        rel_parts = file_path.parts
+        try:
+            rel_parts = file_path.relative_to(workspace_path).parts
+        except ValueError:
+            pass
+
+        parent = workspace_item
+        current_dir = workspace_path
+        for part in rel_parts[:-1]:
+            current_dir = current_dir / part
+            suite_name = TestSuite.name_from_source(current_dir)
+            suite_longname = _compose_fast_longname(parent, suite_name)
+            suite_id = f"{current_dir};{suite_longname}"
+            suite_item = suite_by_id.get(suite_id)
+            if suite_item is None:
+                suite_item = TestItem(
+                    type="suite",
+                    id=suite_id,
+                    name=suite_name,
+                    longname=suite_longname,
+                    uri=str(Uri.from_path(current_dir)),
+                    source=str(current_dir),
+                    rel_source=get_rel_source(current_dir),
+                    needs_parse_include=RF_VERSION >= (6, 1),
+                    rpa=False,
+                )
+                suite_by_id[suite_id] = suite_item
+                suite_parent_by_id[suite_id] = parent.id
+                if stream_empty_suites:
+                    _write_incremental_discover_event(
+                        {
+                            "event": "item",
+                            "item": as_dict(suite_item, remove_defaults=True),
+                            "parentId": parent.id,
+                        }
+                    )
+                    emitted_suite_ids.add(suite_id)
+            else:
+                suite_parent_by_id.setdefault(suite_id, parent.id)
+            parent = suite_item
+
+        if file_path.name.lower() == "__init__.robot":
+            target_suite = parent
+        else:
+            suite_name = TestSuite.name_from_source(file_path)
+            suite_longname = _compose_fast_longname(parent, suite_name)
+            suite_id = f"{file_path};{suite_longname}"
+            suite_item = suite_by_id.get(suite_id)
+            if suite_item is None:
+                suite_item = TestItem(
+                    type="suite",
+                    id=suite_id,
+                    name=suite_name,
+                    longname=suite_longname,
+                    uri=str(Uri.from_path(file_path)),
+                    source=str(file_path),
+                    rel_source=get_rel_source(file_path),
+                    range=Range(start=Position(line=0, character=0), end=Position(line=0, character=0)),
+                    needs_parse_include=RF_VERSION >= (6, 1),
+                    rpa=False,
+                )
+                suite_by_id[suite_id] = suite_item
+                suite_parent_by_id[suite_id] = parent.id
+                if stream_empty_suites:
+                    _write_incremental_discover_event(
+                        {
+                            "event": "item",
+                            "item": as_dict(suite_item, remove_defaults=True),
+                            "parentId": parent.id,
+                        }
+                    )
+                    emitted_suite_ids.add(suite_id)
+            else:
+                suite_parent_by_id.setdefault(suite_id, parent.id)
+            target_suite = suite_item
+
+        if suite_filters and not any(_fast_match(target_suite.longname, f) for f in suite_filters):
+            continue
+        if by_longname and not any(_fast_match(target_suite.longname, f) for f in by_longname):
+            continue
+        if exclude_by_longname and any(_fast_match(target_suite.longname, f) for f in exclude_by_longname):
+            continue
+
+        inherited_force_tags = _get_cached_inherited_force_tags(
+            file_path, workspace_path, force_tags_cache, inherited_force_tags_cache
+        )
+        extracted_items = _extract_fast_items_from_path(file_path)
+        for item_type, test_name, lineno, test_tags in extracted_items:
+            combined_tags = list(dict.fromkeys([*inherited_force_tags, *test_tags]))
+            if not _fast_match_tags(combined_tags, include_tag_patterns, exclude_tag_patterns):
+                continue
+
+            longname = _compose_fast_longname(target_suite, test_name)
+            if test_filters and not any(_fast_match(longname, f) for f in test_filters):
+                continue
+            if by_longname and not any(_fast_match(longname, f) for f in by_longname):
+                continue
+            if exclude_by_longname and any(_fast_match(longname, f) for f in exclude_by_longname):
+                continue
+
+            if item_type == "task":
+                tasks_count += 1
+            else:
+                tests_count += 1
+
+            tag_count = len(combined_tags)
+            tag_chars = sum(len(tag) for tag in combined_tags)
+            total_tag_entries += tag_count
+            total_tag_chars += tag_chars
+            max_tags_per_item = max(max_tags_per_item, tag_count)
+            max_tag_chars_per_item = max(max_tag_chars_per_item, tag_chars)
+
+            child = TestItem(
+                type=item_type,
+                id=f"{file_path};{longname};{lineno}",
+                name=test_name,
+                longname=longname,
+                lineno=lineno,
+                uri=str(Uri.from_path(file_path)),
+                source=str(file_path),
+                rel_source=get_rel_source(file_path),
+                range=Range(
+                    start=Position(line=lineno - 1, character=0),
+                    end=Position(line=lineno - 1, character=0),
+                ),
+                tags=combined_tags if combined_tags else None,
+                rpa=item_type == "task",
+            )
+            max_longname_len = max(max_longname_len, len(longname))
+            max_source_len = max(max_source_len, len(str(file_path)))
+            if not stream_empty_suites:
+                emit_suite_if_needed(target_suite.id)
+            _write_incremental_discover_event(
+                {
+                    "event": "item",
+                    "item": as_dict(child, remove_defaults=True),
+                    "parentId": target_suite.id,
+                }
+            )
+
+        file_elapsed = time.perf_counter() - file_started
+        total_file_scan_seconds += file_elapsed
+        if file_elapsed >= _FAST_DISCOVERY_SLOW_FILE_THRESHOLD_S:
+            _emit_fast_discovery_log(
+                f"discover fast: slow file elapsed={file_elapsed:.3f}s extracted={len(extracted_items)} path={file_path}"
+            )
+
+        if index % _FAST_DISCOVERY_PROGRESS_INTERVAL == 0:
+            elapsed = time.perf_counter() - started
+            _emit_fast_discovery_log(
+                f"discover fast: progress files={index}/{len(files)} tests={tests_count} tasks={tasks_count} elapsed={elapsed:.3f}s"
+            )
+
+    completed = time.perf_counter()
+    _emit_fast_discovery_log(
+        "discover fast timings (s): "
+        f"handle_options={after_handle_options - started:.3f}, "
+        f"collect_files={after_collect_files - after_handle_options:.3f}, "
+        f"scan_files={total_file_scan_seconds:.3f}, "
+        f"total={completed - started:.3f}"
+    )
+    _emit_fast_discovery_log(
+        "discover fast payload stats: "
+        f"tests={tests_count} tasks={tasks_count} suites={len(suite_by_id)} "
+        f"total_tag_entries={total_tag_entries} total_tag_chars={total_tag_chars} "
+        f"max_tags_per_item={max_tags_per_item} max_tag_chars_per_item={max_tag_chars_per_item} "
+        f"max_longname_len={max_longname_len} max_source_len={max_source_len}"
+    )
+    app.verbose(
+        lambda: (
+            "discover fast summary: "
+            f"files={len(files)} tests={tests_count} tasks={tasks_count} "
+            f"candidates={len(_stdin_candidates or [])}"
+        )
+    )
+
+    _write_incremental_discover_event({"event": "end"})
+    sys.stdout.flush()
+    write_elapsed = time.perf_counter() - write_started
+    app.verbose(lambda: f"discover output: incremental stream done elapsed={write_elapsed:.3f}s")
+
+
 def get_rel_source(source: Union[str, Path, None]) -> Optional[str]:
     if source is None:
         return None
@@ -267,6 +1124,11 @@ class Collector(SuiteVisitor):
         self._collected: List[MutableMapping[str, Any]] = [NormalizedDict(ignore="_")]
 
     def visit_suite(self, suite: TestSuite) -> None:
+        if _discover_log_visited_files and _app is not None and suite.source is not None:
+            source_path = Path(suite.source)
+            if source_path.is_file():
+                _app.verbose(lambda: f"discover: visit file {source_path}")
+
         if suite.name in self._collected[-1] and suite.parent.source:
             LOGGER.warn(
                 (
@@ -386,9 +1248,16 @@ class Collector(SuiteVisitor):
     help="Read file contents from stdin. This is an internal option.",
     hidden=show_hidden_arguments(),
 )
+@click.option(
+    "--run-empty-suite / --no-run-empty-suite",
+    "run_empty_suite",
+    default=True,
+    show_default=True,
+    help="Keep empty suites in discovery results.",
+)
 @add_options(*ROBOT_VERSION_OPTIONS)
 @pass_application
-def discover(app: Application, show_diagnostics: bool, read_from_stdin: bool) -> None:
+def discover(app: Application, show_diagnostics: bool, read_from_stdin: bool, run_empty_suite: bool) -> None:
     """\
     Commands to discover informations about the current project.
 
@@ -402,12 +1271,44 @@ def discover(app: Application, show_diagnostics: bool, read_from_stdin: bool) ->
     global _app
     _app = app
     app.show_diagnostics = show_diagnostics or app.config.log_enabled
+    global _stdin_data
+    global _stdin_candidates
+    global _discover_log_visited_files
+    global _discover_run_empty_suite
+    _stdin_data = None
+    _stdin_candidates = None
+    _discover_run_empty_suite = run_empty_suite
+    _discover_log_visited_files = os.getenv("ROBOTCODE_DISCOVER_LOG_VISITED_FILES", "").lower() in [
+        "on",
+        "1",
+        "yes",
+        "true",
+    ]
     if read_from_stdin:
-        global _stdin_data
-        _stdin_data = {
-            Uri(k).normalized(): v for k, v in from_json(sys.stdin.buffer.read(), Dict[str, str], strict=True).items()
-        }
-        app.verbose(f"Read data from stdin: {_stdin_data!r}")
+        stdin_raw = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+
+        if isinstance(stdin_raw, dict) and ("documents" in stdin_raw or "candidates" in stdin_raw):
+            documents_raw = stdin_raw.get("documents", {})
+            candidates_raw = stdin_raw.get("candidates", [])
+            _stdin_data = (
+                {Uri(k).normalized(): v for k, v in documents_raw.items() if isinstance(k, str) and isinstance(v, str)}
+                if isinstance(documents_raw, dict)
+                else {}
+            )
+            _stdin_candidates = (
+                [v for v in candidates_raw if isinstance(v, str)] if isinstance(candidates_raw, list) else None
+            )
+        else:
+            _stdin_data = (
+                {Uri(k).normalized(): v for k, v in stdin_raw.items() if isinstance(k, str) and isinstance(v, str)}
+                if isinstance(stdin_raw, dict)
+                else {}
+            )
+            _stdin_candidates = None
+
+        app.verbose(
+            f"Read data from stdin: documents={len(_stdin_data)} candidates={len(_stdin_candidates or [])}"
+        )
 
 
 RE_IN_FILE_LINE_MATCHER = re.compile(
@@ -478,12 +1379,16 @@ def handle_options(
     exclude_by_longname: Tuple[str, ...],
     robot_options_and_args: Tuple[str, ...],
 ) -> Tuple[TestSuite, Collector, Optional[Dict[str, List[Diagnostic]]]]:
+    started = time.perf_counter()
     root_folder, profile, cmd_options = handle_robot_options(app, robot_options_and_args)
+
+    after_handle_robot_options = time.perf_counter()
 
     with app.chdir(root_folder) as orig_folder:
         diagnostics_logger = DiagnosticsLogger()
         try:
             _patch()
+            after_patch = time.perf_counter()
 
             options, arguments = RobotFrameworkEx(
                 app,
@@ -499,7 +1404,14 @@ def handle_options(
                 orig_folder,
                 by_longname,
                 exclude_by_longname,
-            ).parse_arguments((*cmd_options, "--runemptysuite", *robot_options_and_args))
+            ).parse_arguments(
+                (
+                    *cmd_options,
+                    *( ("--runemptysuite",) if _discover_run_empty_suite else () ),
+                    *robot_options_and_args,
+                )
+            )
+            after_parse_arguments = time.perf_counter()
 
             settings = RobotSettings(options)
 
@@ -509,6 +1421,7 @@ def handle_options(
                 LOGGER.unregister_console_logger()
 
             LOGGER.register_logger(diagnostics_logger)
+            after_logger_setup = time.perf_counter()
 
             if settings.pythonpath:
                 sys.path = settings.pythonpath + sys.path
@@ -539,16 +1452,43 @@ def handle_options(
                 )
 
             suite = builder.build(*arguments)
+            after_build = time.perf_counter()
             settings.rpa = suite.rpa
             if settings.pre_run_modifiers:
                 suite.visit(ModelModifier(settings.pre_run_modifiers, settings.run_empty_suite, LOGGER))
+            after_modifiers = time.perf_counter()
             suite.configure(**settings.suite_config)
+            after_configure = time.perf_counter()
 
             collector = Collector()
 
             suite.visit(collector)
+            after_collect = time.perf_counter()
+            diagnostics = build_diagnostics(diagnostics_logger.messages)
+            after_diagnostics = time.perf_counter()
 
-            return suite, collector, build_diagnostics(diagnostics_logger.messages)
+            app.verbose(
+                lambda: (
+                    "discover timings (s): "
+                    f"config/profile={after_handle_robot_options - started:.3f}, "
+                    f"patch={after_patch - after_handle_robot_options:.3f}, "
+                    f"parse_args={after_parse_arguments - after_patch:.3f}, "
+                    f"logger_setup={after_logger_setup - after_parse_arguments:.3f}, "
+                    f"builder_build={after_build - after_logger_setup:.3f}, "
+                    f"pre_run_modifiers={after_modifiers - after_build:.3f}, "
+                    f"suite_configure={after_configure - after_modifiers:.3f}, "
+                    f"collector_visit={after_collect - after_configure:.3f}, "
+                    f"diagnostics={after_diagnostics - after_collect:.3f}, "
+                    f"total={after_diagnostics - started:.3f}, "
+                    f"arguments={len(arguments)}, "
+                    f"candidates={len(_stdin_candidates or [])}, "
+                    f"tests={collector.statistics.tests}, "
+                    f"tasks={collector.statistics.tasks}, "
+                    f"suites={collector.statistics.suites}"
+                )
+            )
+
+            return suite, collector, diagnostics
 
         except Information as err:
             app.echo(str(err))
@@ -580,6 +1520,82 @@ def print_statistics(app: Application, suite: TestSuite, collector: Collector) -
             yield f"{collector.statistics.tasks}{os.linesep}"
 
     app.echo_via_pager(print())
+
+
+def print_machine_data(app: Application, data: Any) -> None:
+    if app.config.output_format in (OutputFormat.JSON, OutputFormat.JSON_INDENT):
+        serialize_started = time.perf_counter()
+        app.verbose("discover output: json serialize start")
+        text = as_json(
+            data,
+            indent=app.config.output_format == OutputFormat.JSON_INDENT,
+            compact=app.config.output_format == OutputFormat.JSON,
+        )
+        serialize_elapsed = time.perf_counter() - serialize_started
+        app.verbose(
+            lambda: f"discover output: json serialize done chars={len(text)} elapsed={serialize_elapsed:.3f}s"
+        )
+
+        write_started = time.perf_counter()
+        app.verbose("discover output: stdout write start")
+        sys.stdout.write(text)
+        if not text.endswith(os.linesep):
+            sys.stdout.write(os.linesep)
+        sys.stdout.flush()
+        write_elapsed = time.perf_counter() - write_started
+        app.verbose(lambda: f"discover output: stdout write done elapsed={write_elapsed:.3f}s")
+        return
+
+    app.print_data(data, remove_defaults=True)
+
+
+def _iter_items_with_parent(
+    items: Iterable[TestItem], parent_id: Optional[str] = None
+) -> Iterable[Tuple[TestItem, Optional[str]]]:
+    for item in items:
+        yield item, parent_id
+        if item.children:
+            yield from _iter_items_with_parent(item.children, item.id)
+
+
+def print_machine_data_incremental_result(app: Application, data: ResultItem) -> None:
+    app.verbose("discover output: incremental stream start")
+    write_started = time.perf_counter()
+
+    sys.stdout.write('{"event":"start","version":1}' + os.linesep)
+
+    for item, parent_id in _iter_items_with_parent(data.items):
+        item_dict = as_dict(item, remove_defaults=True)
+        if "children" in item_dict:
+            del item_dict["children"]
+
+        event: Dict[str, Any] = {
+            "event": "item",
+            "item": item_dict,
+        }
+        if parent_id is not None:
+            event["parentId"] = parent_id
+
+        sys.stdout.write(json.dumps(event, separators=(",", ":")))
+        sys.stdout.write(os.linesep)
+
+    if data.diagnostics is not None:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "event": "diagnostics",
+                    "diagnostics": as_dict(data.diagnostics, remove_defaults=True),
+                },
+                separators=(",", ":"),
+            )
+        )
+        sys.stdout.write(os.linesep)
+
+    sys.stdout.write('{"event":"end"}' + os.linesep)
+    sys.stdout.flush()
+
+    write_elapsed = time.perf_counter() - write_started
+    app.verbose(lambda: f"discover output: incremental stream done elapsed={write_elapsed:.3f}s")
 
 
 @discover.command(
@@ -654,7 +1670,7 @@ def all(
             print_statistics(app, suite, collector)
 
         else:
-            app.print_data(ResultItem([collector.all], diagnostics), remove_defaults=True)
+            print_machine_data(app, ResultItem([collector.all], diagnostics))
 
 
 def _test_or_tasks(
@@ -691,7 +1707,7 @@ def _test_or_tasks(
                 print_statistics(app, suite, collector)
 
         else:
-            app.print_data(ResultItem(collector.test_and_tasks, diagnostics), remove_defaults=True)
+            print_machine_data(app, ResultItem(collector.test_and_tasks, diagnostics))
 
 
 @discover.command(
@@ -843,7 +1859,7 @@ def suites(
             print_statistics(app, suite, collector)
 
         else:
-            app.print_data(ResultItem(collector.suites, diagnostics), remove_defaults=True)
+            print_machine_data(app, ResultItem(collector.suites, diagnostics))
 
 
 @dataclass
@@ -943,7 +1959,7 @@ def tags(
             print_statistics(app, suite, collector)
 
         else:
-            app.print_data(TagsResult(collector.normalized_tags), remove_defaults=True)
+            print_machine_data(app, TagsResult(collector.normalized_tags))
 
 
 @dataclass
@@ -1012,7 +2028,7 @@ def info(app: Application) -> None:
         for key, value in as_dict(info, remove_defaults=True).items():
             app.echo_via_pager(f"{key}: {value}")
     else:
-        app.print_data(info, remove_defaults=True)
+        print_machine_data(app, info)
 
 
 @discover.command(add_help_option=True)
@@ -1089,4 +2105,41 @@ def files(app: Application, full_paths: bool, paths: Iterable[Path]) -> None:
 
         app.echo_via_pager(print())
     else:
+        print_machine_data(app, result)
+
+
+@discover.command(
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    add_help_option=True,
+    epilog="Use `-- --help` to see `robot` help.",
+)
+@add_options(*ROBOT_OPTIONS)
+@click.option(
+    "--incremental-output / --no-incremental-output",
+    "incremental_output",
+    default=False,
+    hidden=show_hidden_arguments(),
+    help="Emit discovery output incrementally as NDJSON events. This is an internal option.",
+)
+@pass_application
+def fast(
+    app: Application,
+    incremental_output: bool,
+    by_longname: Tuple[str, ...],
+    exclude_by_longname: Tuple[str, ...],
+    robot_options_and_args: Tuple[str, ...],
+) -> None:
+    """\
+    Fast test discovery using lexical scanning only.
+
+    This mode is optimized for speed and intentionally does not support all
+    Robot Framework discovery semantics.
+    """
+    if app.config.output_format is None or app.config.output_format == OutputFormat.TEXT:
+        result = _build_fast_discovery_result(app, by_longname, exclude_by_longname, robot_options_and_args)
         app.print_data(result, remove_defaults=True)
+    elif incremental_output:
+        _stream_fast_discovery_result(app, by_longname, exclude_by_longname, robot_options_and_args)
+    else:
+        result = _build_fast_discovery_result(app, by_longname, exclude_by_longname, robot_options_and_args)
+        print_machine_data(app, result)

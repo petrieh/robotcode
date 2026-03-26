@@ -364,7 +364,7 @@ class RobotCodeDebugAdapterDescriptorFactory implements vscode.DebugAdapterDescr
   }
 }
 
-export class DebugManager {
+export class DebugManager implements vscode.Disposable {
   private _disposables: vscode.Disposable;
   private _attachedSessions = new WeakValueSet<vscode.DebugSession>();
 
@@ -476,6 +476,39 @@ export class DebugManager {
     this._disposables.dispose();
   }
 
+  private static getParseIncludeNarrowedPaths(folder: vscode.WorkspaceFolder, relSources: string[]): string[] {
+    const narrowed = new Set<string>();
+
+    for (const relSource of relSources) {
+      if (!relSource) {
+        continue;
+      }
+
+      const normalized = relSource.replace(/\\/g, "/");
+      const firstSegment = normalized.split("/").find((segment) => segment.length > 0);
+
+      if (firstSegment) {
+        narrowed.add(firstSegment);
+        continue;
+      }
+
+      const relativeFromWorkspace = path.relative(folder.uri.fsPath, relSource);
+      if (!relativeFromWorkspace || relativeFromWorkspace.startsWith("..")) {
+        continue;
+      }
+
+      const fallbackSegment = relativeFromWorkspace
+        .replace(/\\/g, "/")
+        .split("/")
+        .find((segment) => segment.length > 0);
+      if (fallbackSegment) {
+        narrowed.add(fallbackSegment);
+      }
+    }
+
+    return Array.from(narrowed);
+  }
+
   static async runTests(
     folder: vscode.WorkspaceFolder,
     suites: string[],
@@ -492,13 +525,6 @@ export class DebugManager {
     const config = vscode.workspace.getConfiguration(CONFIG_SECTION, folder);
 
     const args = [];
-
-    if (needs_parse_include) {
-      for (const s of rel_sources) {
-        args.push("-I");
-        args.push(escapeRobotGlobPatterns(s));
-      }
-    }
 
     if (topLevelSuiteName) {
       args.push("-N");
@@ -540,8 +566,23 @@ export class DebugManager {
       testLaunchConfig.target = "";
     }
 
+    const hasExplicitLaunchPaths = "paths" in testLaunchConfig;
     let paths = config.get<string[]>("robot.paths", []);
-    paths = "paths" in testLaunchConfig ? [...(testLaunchConfig.paths as string[]), ...paths] : paths;
+    paths = hasExplicitLaunchPaths ? [...(testLaunchConfig.paths as string[]), ...paths] : paths;
+
+    if (!hasExplicitLaunchPaths && needs_parse_include && rel_sources.length > 0) {
+      const narrowedPaths = this.getParseIncludeNarrowedPaths(folder, rel_sources);
+      if (narrowedPaths.length > 0) {
+        paths = narrowedPaths;
+      }
+    }
+
+    if (needs_parse_include) {
+      for (const s of rel_sources) {
+        args.push("-I");
+        args.push(escapeRobotGlobPatterns(s));
+      }
+    }
 
     if (profiles) testLaunchConfig.profiles = profiles;
 

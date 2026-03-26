@@ -1282,6 +1282,44 @@
             "default": true,
             "description": "Enable/disable whether Robot Framework tests and tasks are integrated into the VSCode Test/Test Explorer view.",
             "scope": "resource"
+          },
+          "robotcode.testExplorer.fastDiscovery.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Experimental optimization for very large workspaces. Prefilters files containing Test Cases/Tasks before full discovery.",
+            "scope": "resource"
+          },
+          "robotcode.testExplorer.fastDiscovery.prefilterCommand": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "gitGrep",
+              "ripGrep",
+              "grep",
+              "none"
+            ],
+            "default": "auto",
+            "markdownDescription": "Selects prefilter command for fast discovery. `auto` tries `git grep` first, then `ripgrep`, then `grep`, and falls back to normal discovery if unavailable. `none` disables prefiltering.",
+            "scope": "resource"
+          },
+          "robotcode.testExplorer.fastDiscovery.command.enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Use `robotcode discover fast` for workspace discovery when fast discovery prefiltering is enabled. Automatically falls back to full discovery if unsupported options are detected.",
+            "scope": "resource"
+          },
+          "robotcode.testExplorer.discovery.runEmptySuite": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Keep empty suites in Test Explorer discovery results. Disable to show only suites with executable tests/tasks.",
+            "scope": "resource"
+          },
+          "robotcode.testExplorer.discovery.fastTimeoutMs": {
+            "type": "integer",
+            "default": 0,
+            "minimum": 0,
+            "markdownDescription": "Override fast discovery timeout in milliseconds. `0` uses adaptive timeout based on candidate count.",
+            "scope": "resource"
           }
         }
       },
