@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple, Union
 
@@ -72,7 +73,20 @@ def get_config_files(
             else:
                 verbose_callback("No configuration files found.")
 
-    user_config = get_user_config_file(verbose_callback=verbose_callback)
+    disable_user_config_create = os.getenv("ROBOTCODE_DISABLE_USER_CONFIG_CREATE", "").lower() in [
+        "on",
+        "1",
+        "yes",
+        "true",
+    ]
+
+    if disable_user_config_create and verbose_callback:
+        verbose_callback(
+            "Automatic creation of user configuration is disabled by "
+            "ROBOTCODE_DISABLE_USER_CONFIG_CREATE."
+        )
+
+    user_config = get_user_config_file(create=not disable_user_config_create, verbose_callback=verbose_callback)
 
     return (
         [

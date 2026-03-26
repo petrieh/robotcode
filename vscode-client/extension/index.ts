@@ -200,22 +200,26 @@ export async function activateAsync(context: vscode.ExtensionContext): Promise<v
         }, 1000);
       }
     }),
-    vscode.lm.registerTool(
-      "robot-get_library_documentation",
-      new GetLibraryInfoTool(context, languageClientManger, outputChannel),
-    ),
-    vscode.lm.registerTool(
-      "robot-get_keyword_documentation",
-      new GetKeywordInfoTool(context, languageClientManger, outputChannel),
-    ),
-    vscode.lm.registerTool(
-      "robot-get_file_imports",
-      new GetDocumentImportsTool(context, languageClientManger, outputChannel),
-    ),
-    vscode.lm.registerTool(
-      "robot-get_environment_details",
-      new GetEnvironmentDetails(context, languageClientManger, outputChannel),
-    ),
+    ...(typeof vscode.lm?.registerTool === "function"
+      ? [
+          vscode.lm.registerTool(
+            "robot-get_library_documentation",
+            new GetLibraryInfoTool(context, languageClientManger, outputChannel),
+          ),
+          vscode.lm.registerTool(
+            "robot-get_keyword_documentation",
+            new GetKeywordInfoTool(context, languageClientManger, outputChannel),
+          ),
+          vscode.lm.registerTool(
+            "robot-get_file_imports",
+            new GetDocumentImportsTool(context, languageClientManger, outputChannel),
+          ),
+          vscode.lm.registerTool(
+            "robot-get_environment_details",
+            new GetEnvironmentDetails(context, languageClientManger, outputChannel),
+          ),
+        ]
+      : []),
   );
 
   const collection = context.environmentVariableCollection;
